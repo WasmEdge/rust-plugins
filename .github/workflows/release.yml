@@ -1,0 +1,181 @@
+name: release
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: "Log level"
+        required: true
+        default: "info"
+  push:
+    tags:
+      - "[0-9]+.[0-9]+.[0-9]+*"
+jobs:
+  get_version:
+    name: Retrieve version information
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.prep.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Ensure git safe directory
+        run: |
+          git config --global --add safe.directory $(pwd)
+      - name: Get version
+        id: prep
+        run: |
+          # Retrieve annotated tags. Details: https://github.com/actions/checkout/issues/290
+          git fetch --tags --force
+          echo "Set version: $(git describe --match '[0-9].[0-9]*' --tag | cut -d '-' -f 1)"
+          echo "version=$(git describe --match '[0-9].[0-9]*' --tag | cut -d '-' -f 1)" >> $GITHUB_OUTPUT
+
+  build_and_upload_wasinn_burnrs_linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: 'ubuntu-latest'
+            docker_tag: 'ubuntu-20.04-build-clang-plugins-deps'
+            asset_tag: 'ubuntu20.04_x86_64'
+          - runner: 'ubuntu-latest'
+            docker_tag: 'ubuntu-build-clang-plugins-deps'
+            asset_tag: 'ubuntu22.04-clang'
+          - runner: 'ubuntu-latest'
+            docker_tag: 'manylinux_2_28_x86_64-plugins-deps'
+            asset_tag: 'manylinux_2_28_x86_64'
+          - runner: 'linux-arm64-v2'
+            docker_tag: 'manylinux_2_28_aarch64-plugins-deps'
+            asset_tag: 'manylinux_2_28_aarch64'
+    name: Build and upload WASI-NN with burn.rs for ${{ matrix.asset_tag }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      models: squeezenet whisper
+      output_dir: target/release
+      output_bin: libwasmedge_plugin_wasinn.so
+      output_fmt_bin: libwasmedgePluginWasiNN.so
+    needs: [ get_version ]
+    container:
+      image: wasmedge/wasmedge:${{ matrix.docker_tag }}
+    steps:
+        - uses: actions/checkout@v4
+          with:
+            fetch-depth: 0
+        - name: Cache Rust build
+          uses: actions/cache@v4
+          with:
+            path: |
+              ~/.cargo/registry
+              ~/.cargo/git
+              target
+            key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-${{ env.models }}
+            restore-keys: |
+              ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+        - name: Ensure git safe directory
+          run: |
+            git config --global --add safe.directory $(pwd)
+        - name: Install rust
+          uses: actions-rust-lang/setup-rust-toolchain@v1
+        - name: Install dependencies
+          if: contains(matrix.asset_tag, 'manylinux')
+          run: |
+            yum update -y
+            yum install -y pkg-config openssl-devel
+        - name: Install dependencies
+          if: contains(matrix.asset_tag, 'ubuntu')
+          run: |
+            apt-get update
+            apt-get -y install pkg-config libssl-dev
+        - name: Build WASI-NN with Burn.rs
+          shell: bash
+          run: |
+            for model in ${{ env.models }}; do
+              echo "Building plugin for model: $model"
+              cargo build --release --features=$model -p wasi_nn_burnrs
+              mv ${{ env.output_dir }}/${{ env.output_bin }} ${{ env.output_fmt_bin }}
+              tar -czvf plugin_wasinn_burnrs_${model}.tar.gz ${{ env.output_fmt_bin }}
+            done
+        - name: Install gh
+          if: contains(matrix.asset_tag, 'manylinux')
+          run: |
+            yum check-update || true
+            yum install -y gh
+        - name: Install gh
+          if: contains(matrix.asset_tag, 'ubuntu')
+          run: |
+            type -p curl >/dev/null || (apt update && apt install curl -y)
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+            && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+            && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+            && apt update \
+            && apt install gh -y
+        - name: Upload wasi_nn-burnrs plugin tar.gz package
+          shell: bash
+          env:
+            GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          run: |
+            for model in ${{ env.models }}; do
+              mv plugin_wasinn_burnrs_${model}.tar.gz WasmEdge-plugin-wasi_nn-burnrs-${model}-${{ needs.get_version.outputs.version }}-${{ matrix.asset_tag }}.tar.gz
+              gh release upload ${{ needs.get_version.outputs.version }} WasmEdge-plugin-wasi_nn-burnrs-${model}-${{ needs.get_version.outputs.version }}-${{ matrix.asset_tag }}.tar.gz --clobber
+            done
+
+  build_and_upload_wasinn_burnrs_macos:
+    strategy:
+      matrix:
+        include:
+          - system: MacOS 12 (x86_64)
+            host_runner: macos-12
+            arch: x86_64
+          - system: MacOS 14 (arm64)
+            host_runner: macos-14
+            arch: arm64
+    name: Build and upload WASI-NN with burn.rs on ${{ matrix.system }}
+    runs-on: ${{ matrix.host_runner }}
+    env:
+      models: squeezenet whisper
+      output_dir: target/release
+      output_bin: libwasmedge_plugin_wasinn.dylib
+      output_fmt_bin: libwasmedgePluginWasiNN.dylib
+    needs: [ get_version ]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Cache Rust build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}-${{ env.models }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+      - name: Grant the safe directory for git
+        run: |
+          git config --global --add safe.directory $(pwd)
+      - name: Install rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      - name: Build WASI-NN with Burn.rs
+        shell: bash
+        run: |
+          for model in ${{ env.models }}; do
+            echo "Building plugin for model: $model"
+            cargo build --release --features=$model -p wasi_nn_burnrs
+            mv ${{ env.output_dir }}/${{ env.output_bin }} ${{ env.output_fmt_bin }}
+            tar -czvf plugin_wasinn_burnrs_${model}.tar.gz ${{ env.output_fmt_bin }}
+          done
+      - name: Upload wasi_nn-burnrs plugin tar.gz package
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for model in ${{ env.models }}; do
+            mv plugin_wasinn_burnrs_${model}.tar.gz WasmEdge-plugin-wasi_nn-burnrs-${model}-${{ needs.get_version.outputs.version }}-darwin_${{ matrix.arch }}.tar.gz
+            gh release upload ${{ needs.get_version.outputs.version }} WasmEdge-plugin-wasi_nn-burnrs-${model}-${{ needs.get_version.outputs.version }}-darwin_${{ matrix.arch }}.tar.gz --clobber
+          done
